@@ -1,15 +1,48 @@
 // ── VoxGuard Analysis Engine Bridge ─────────────────────────────────
 // Connects UI to real DSP decoding and pre-calculated forensic datasets.
+// Hybrid Architecture: Dispatches to /api/analyze endpoint with automatic
+// client-side DSP fallback for offline and low-latency local execution.
 
 import { decodeAudio, runFullForensicAnalysis } from "./dsp";
-import type { AnalysisResult } from "./types";
+import type { AnalysisResult, ApiResponse } from "./types";
 
 export async function analyzeRealAudio(
   file: File | Blob,
   forcedVerdict?: "human" | "cloned" | "suspicious"
 ): Promise<AnalysisResult> {
-  const decoded = await decodeAudio(file);
   const fileName = (file as File).name || `recording_${Date.now()}.wav`;
+
+  // ── Strategy 1: Attempt Server-Side Forensic API Analysis ───────────────
+  if (typeof window !== "undefined" && typeof fetch !== "undefined") {
+    try {
+      const formData = new FormData();
+      formData.append("file", file, fileName);
+      if (forcedVerdict) {
+        formData.append("forcedVerdict", forcedVerdict);
+      }
+
+      const response = await fetch("/api/analyze", {
+        method: "POST",
+        body: formData,
+      });
+
+      if (response.ok) {
+        const json: ApiResponse<AnalysisResult> = await response.json();
+        if (json.success && json.data) {
+          const serverResult = json.data;
+          // Attach local object URL for instant audio playback
+          serverResult.audio.audioBlob = file;
+          serverResult.audio.audioUrl = URL.createObjectURL(file);
+          return serverResult;
+        }
+      }
+    } catch {
+      // Server API unreachable or offline; seamlessly continue to client DSP
+    }
+  }
+
+  // ── Strategy 2: Client-Side Radix-2 DSP & Autocorrelation Fallback ──────
+  const decoded = await decodeAudio(file);
   const result = runFullForensicAnalysis(decoded, fileName, forcedVerdict);
 
   // Attach object URL for audio playback

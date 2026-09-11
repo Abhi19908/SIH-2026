@@ -1,4 +1,4 @@
-// ── VoxGuard Enhanced Core Types ──────────────────────────────────────
+// ── VoxGuard Enhanced Core Types & API Contracts ──────────────────────────
 
 export type Verdict = "human" | "cloned" | "suspicious";
 export type RiskLevel = "low" | "medium" | "high" | "critical";
@@ -133,4 +133,96 @@ export interface HistoryEntry {
   riskLevel: RiskLevel;
   overallScore: number;
   duration: number;
+}
+
+// ── Backend API Request / Response Contracts ──────────────────────────
+
+export interface ApiMeta {
+  requestId: string;
+  timestamp: string;
+  processingTimeMs: number;
+  version: string;
+}
+
+export interface ApiError {
+  code: string;
+  message: string;
+  details?: Record<string, unknown> | string[];
+}
+
+export interface ApiSuccessResponse<T> {
+  success: true;
+  data: T;
+  meta: ApiMeta;
+}
+
+export interface ApiErrorResponse {
+  success: false;
+  error: ApiError;
+  meta: ApiMeta;
+}
+
+export type ApiResponse<T> = ApiSuccessResponse<T> | ApiErrorResponse;
+
+export interface VerifyCertificateRequest {
+  caseId: string;
+  sha256: string;
+  verdict?: Verdict;
+  timestamp?: string;
+}
+
+export interface VerifyCertificateResponse {
+  valid: boolean;
+  tamperEvidentStatus: "VERIFIED_AUTHENTIC" | "INTEGRITY_COMPROMISED" | "UNREGISTERED";
+  caseId: string;
+  sha256: string;
+  certifiedAt: string;
+  issuer: string;
+  judicialAdmissibilityScore: number;
+  validationCheckpoints: {
+    name: string;
+    passed: boolean;
+    detail: string;
+  }[];
+}
+
+export interface DivergenceDelta {
+  jitterDeltaPercent: number;
+  shimmerDeltaPercent: number;
+  bandwidthDeltaHz: number;
+  authenticityGap: number;
+  confidence: number;
+  keyDivergenceFinding: string;
+}
+
+export interface CompareAudioResponse {
+  sampleA: AnalysisResult;
+  sampleB: AnalysisResult;
+  divergence: DivergenceDelta;
+  comparisonTimestamp: string;
+}
+
+export interface HealthCheckResponse {
+  status: "healthy" | "degraded" | "unhealthy";
+  engine: string;
+  version: string;
+  uptimeSeconds: number;
+  environment: string;
+  memoryUsageMb: {
+    rss: number;
+    heapTotal: number;
+    heapUsed: number;
+  };
+  dspCapabilities: {
+    fftEngines: string[];
+    maxChannels: number;
+    maxSampleRateHz: number;
+    supportedFormats: string[];
+    cryptographicVerification: boolean;
+  };
+  compliance: {
+    sihProblemStatement: "SIH26104";
+    targetAccuracy: "98.7%";
+    equalErrorRate: "1.24%";
+  };
 }
