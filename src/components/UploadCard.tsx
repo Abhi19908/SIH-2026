@@ -208,29 +208,55 @@ export default function UploadCard({ onFileSelected, onSelectBenchmark, isAnalyz
                     </div>
                   </div>
 
-                  {/* ── analyze button ── */}
-                  <button
-                    onClick={analyze}
-                    disabled={isAnalyzing}
-                    className={cn(
-                      "mt-5 w-full flex items-center justify-center gap-2 py-4 rounded-xl font-bold text-sm transition-all cursor-pointer",
-                      isAnalyzing
-                        ? "bg-cyan-500/20 text-cyan-300 cursor-wait"
-                        : "bg-gradient-to-r from-cyan-500 via-blue-600 to-indigo-600 text-white shadow-[0_0_25px_rgba(6,182,212,0.35)] hover:shadow-[0_0_35px_rgba(6,182,212,0.5)] hover:scale-[1.005] active:scale-[0.995]"
-                    )}
-                  >
-                    {isAnalyzing ? (
-                      <>
-                        <div className="h-4 w-4 border-2 border-cyan-300/30 border-t-cyan-300 rounded-full animate-spin" />
-                        <span>Running DSP &amp; Neural Extraction Engine...</span>
-                      </>
-                    ) : (
-                      <>
-                        <FileAudio size={18} />
-                        <span>Run Full Forensic Deepfake Analysis</span>
-                      </>
-                    )}
-                  </button>
+                  {/* ── Action Buttons ── */}
+                  <div className="mt-5 grid grid-cols-1 sm:grid-cols-2 gap-3">
+                    <button
+                      onClick={analyze}
+                      disabled={isAnalyzing}
+                      className={cn(
+                        "sm:col-span-2 w-full flex items-center justify-center gap-2 py-4 rounded-xl font-bold text-sm transition-all cursor-pointer",
+                        isAnalyzing
+                          ? "bg-cyan-500/20 text-cyan-300 cursor-wait"
+                          : "bg-gradient-to-r from-cyan-500 via-blue-600 to-indigo-600 text-white shadow-[0_0_25px_rgba(6,182,212,0.35)] hover:shadow-[0_0_35px_rgba(6,182,212,0.5)] hover:scale-[1.005] active:scale-[0.995]"
+                      )}
+                    >
+                      {isAnalyzing ? (
+                        <>
+                          <div className="h-4 w-4 border-2 border-cyan-300/30 border-t-cyan-300 rounded-full animate-spin" />
+                          <span>Running DSP &amp; Neural Extraction Engine...</span>
+                        </>
+                      ) : (
+                        <>
+                          <FileAudio size={18} />
+                          <span>Run Full Forensic Deepfake Analysis</span>
+                        </>
+                      )}
+                    </button>
+
+                    <button
+                      onClick={async () => {
+                        clearFile();
+                        await startRecording();
+                      }}
+                      disabled={isAnalyzing}
+                      className="w-full flex items-center justify-center gap-2 py-3 rounded-xl text-xs font-semibold bg-white/[0.04] hover:bg-cyan-500/10 text-slate-300 hover:text-cyan-300 border border-white/[0.08] hover:border-cyan-500/30 transition-all cursor-pointer"
+                    >
+                      <Mic size={15} className="text-cyan-400" />
+                      <span>Record Again (New Take)</span>
+                    </button>
+
+                    <button
+                      onClick={() => {
+                        clearFile();
+                        fileInputRef.current?.click();
+                      }}
+                      disabled={isAnalyzing}
+                      className="w-full flex items-center justify-center gap-2 py-3 rounded-xl text-xs font-semibold bg-white/[0.04] hover:bg-white/[0.08] text-slate-300 hover:text-white border border-white/[0.08] hover:border-white/[0.15] transition-all cursor-pointer"
+                    >
+                      <Upload size={15} className="text-slate-400" />
+                      <span>Choose Different File</span>
+                    </button>
+                  </div>
                 </motion.div>
               )}
             </AnimatePresence>

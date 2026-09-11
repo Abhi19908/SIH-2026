@@ -39,7 +39,7 @@ export async function computeSHA256(buffer: ArrayBuffer): Promise<string> {
 }
 
 /* -------------------------------------------------------------------------- */
-/*  2. Audio Decoding via Web Audio API                                        */
+/*  2. Audio Decoding via Web Audio API & Signal Preprocessing                */
 /* -------------------------------------------------------------------------- */
 
 export interface DecodedAudio {
@@ -51,11 +51,32 @@ export interface DecodedAudio {
   sha256: string;
 }
 
+export function applyPreEmphasis(pcmData: Float32Array, alpha = 0.97): Float32Array {
+  const n = pcmData.length;
+  const filtered = new Float32Array(n);
+  if (n === 0) return filtered;
+  filtered[0] = pcmData[0];
+  for (let i = 1; i < n; i++) {
+    filtered[i] = pcmData[i] - alpha * pcmData[i - 1];
+  }
+  return filtered;
+}
+
+export function removeDCOffset(pcmData: Float32Array): Float32Array {
+  const n = pcmData.length;
+  if (n === 0) return pcmData;
+  let sum = 0;
+  for (let i = 0; i < n; i++) sum += pcmData[i];
+  const mean = sum / n;
+  const cleaned = new Float32Array(n);
+  for (let i = 0; i < n; i++) cleaned[i] = pcmData[i] - mean;
+  return cleaned;
+}
+
 export async function decodeAudio(file: File | Blob): Promise<DecodedAudio> {
   const arrayBuffer = await file.arrayBuffer();
   const sha256 = await computeSHA256(arrayBuffer);
 
-  // Web Audio API in browser
   const AudioContextClass =
     window.AudioContext ||
     (window as unknown as { webkitAudioContext: typeof AudioContext }).webkitAudioContext;
@@ -123,7 +144,6 @@ export function extractWaveformData(pcmData: Float32Array, numPoints = 200): num
 /*  4. Real Fast Fourier Transform (FFT) & Spectrogram Calculation            */
 /* -------------------------------------------------------------------------- */
 
-// Radix-2 Cooley-Tukey FFT implementation
 function fftRadix2(re: Float32Array, im: Float32Array): void {
   const n = re.length;
   let j = 0;
@@ -258,23 +278,33 @@ export function computeRealSTFT(
 }
 
 /* -------------------------------------------------------------------------- */
-/*  5. Normalized Autocorrelation F0 Pitch Tracking (NACF)                    */
+/*  5. Normalized Autocorrelation F0 Pitch Tracking (NACF + PPQ5/APQ5)        */
 /* -------------------------------------------------------------------------- */
 
 export interface PitchAnalysis {
   f0Values: number[];
   meanF0: number;
-  jitterPercent: number; // PPQ (Period Perturbation Quotient)
-  shimmerPercent: number; // APQ (Amplitude Perturbation Quotient)
+  jitterPercent: number; // PPQ-5
+  shimmerPercent: number; // APQ-5
   hnrDb: number; // Harmonic-to-Noise Ratio
   voicedRatio: number;
+  snrDb: number;
+  clippingRatio: number;
 }
 
 export function extractPitchAndPerturbation(
-  pcmData: Float32Array,
+  rawPcmData: Float32Array,
   sampleRate: number
 ): PitchAnalysis {
+  const pcmData = removeDCOffset(rawPcmData);
   const n = pcmData.length;
+
+  let clipCount = 0;
+  for (let i = 0; i < n; i++) {
+    if (Math.abs(pcmData[i]) >= 0.99) clipCount++;
+  }
+  const clippingRatio = n > 0 ? clipCount / n : 0;
+
   if (n < sampleRate * 0.05) {
     return {
       f0Values: [],
@@ -283,52 +313,71 @@ export function extractPitchAndPerturbation(
       shimmerPercent: 2.8,
       hnrDb: 18.5,
       voicedRatio: 0.7,
+      snrDb: 25,
+      clippingRatio,
     };
   }
 
   const minPitchHz = 60;
   const maxPitchHz = 450;
-  const minLag = Math.floor(sampleRate / maxPitchHz);
+  const minLag = Math.max(2, Math.floor(sampleRate / maxPitchHz));
   const maxLag = Math.floor(sampleRate / minPitchHz);
 
   const frameLength = Math.min(1024, Math.floor(sampleRate * 0.03)); // 30ms window
-  const hopSize = Math.floor(sampleRate * 0.015); // 15ms hop
+  const hopSize = Math.floor(sampleRate * 0.012); // 12ms hop
   const numFrames = Math.floor((n - frameLength) / hopSize);
 
+  // VAD calculation
+  const frameEnergies = new Float32Array(numFrames);
+  for (let f = 0; f < numFrames; f++) {
+    const offset = f * hopSize;
+    let sumSq = 0;
+    for (let i = 0; i < frameLength; i++) {
+      const s = pcmData[offset + i];
+      sumSq += s * s;
+    }
+    frameEnergies[f] = Math.sqrt(sumSq / frameLength);
+  }
+
+  const sortedEnergies = Float32Array.from(frameEnergies).sort();
+  const noiseFloor = Math.max(1e-5, sortedEnergies[Math.floor(numFrames * 0.1)] || 1e-4);
+  const peakEnergy = Math.max(1e-4, sortedEnergies[Math.floor(numFrames * 0.95)] || 0.1);
+  const snrDb = Math.min(60, Math.max(4, Math.round(20 * Math.log10(peakEnergy / noiseFloor))));
+  const vadThreshold = Math.max(0.008, noiseFloor * 2.8);
+
   const f0Track: number[] = [];
+  const periods: number[] = [];
   const peakAmplitudes: number[] = [];
   let hnrSum = 0;
   let hnrCount = 0;
+  let speechFrames = 0;
 
   for (let f = 0; f < numFrames; f++) {
+    const rms = frameEnergies[f];
+    if (rms < vadThreshold) continue;
+    speechFrames++;
+
     const offset = f * hopSize;
-
-    let energy = 0;
-    let peakAmp = 0;
-    for (let i = 0; i < frameLength; i++) {
-      const s = pcmData[offset + i];
-      energy += s * s;
-      if (Math.abs(s) > peakAmp) peakAmp = Math.abs(s);
-    }
-
-    if (energy < 1e-4) continue; // Unvoiced / silence
-
     let bestLag = -1;
     let maxNacf = -1;
+    const nacfList: number[] = [];
 
     for (let lag = minLag; lag <= maxLag && offset + lag + frameLength <= n; lag++) {
       let crossCorr = 0;
-      let lagEnergy = 0;
+      let sumSq1 = 0;
+      let sumSq2 = 0;
 
       for (let i = 0; i < frameLength; i++) {
         const s0 = pcmData[offset + i];
         const sLag = pcmData[offset + i + lag];
         crossCorr += s0 * sLag;
-        lagEnergy += sLag * sLag;
+        sumSq1 += s0 * s0;
+        sumSq2 += sLag * sLag;
       }
 
-      const denom = Math.sqrt(energy * lagEnergy);
+      const denom = Math.sqrt(sumSq1 * sumSq2);
       const nacf = denom > 1e-8 ? crossCorr / denom : 0;
+      nacfList.push(nacf);
 
       if (nacf > maxNacf) {
         maxNacf = nacf;
@@ -336,13 +385,32 @@ export function extractPitchAndPerturbation(
       }
     }
 
-    if (maxNacf > 0.45 && bestLag > 0) {
-      const exactF0 = sampleRate / bestLag;
+    if (maxNacf > 0.44 && bestLag > minLag && bestLag < maxLag) {
+      // Sub-sample parabolic interpolation
+      const idx = bestLag - minLag;
+      const alphaVal = nacfList[idx - 1] || maxNacf;
+      const betaVal = maxNacf;
+      const gammaVal = nacfList[idx + 1] || maxNacf;
+      const denomDelta = 2 * (2 * betaVal - alphaVal - gammaVal);
+      const delta = denomDelta !== 0 ? (alphaVal - gammaVal) / denomDelta : 0;
+      const trueLag = bestLag + Math.max(-0.5, Math.min(0.5, delta));
+
+      const exactF0 = sampleRate / trueLag;
       if (exactF0 >= minPitchHz && exactF0 <= maxPitchHz) {
         f0Track.push(exactF0);
-        peakAmplitudes.push(peakAmp);
+        periods.push(trueLag / sampleRate);
 
-        const rMax = Math.min(0.999, Math.max(0.001, maxNacf));
+        let maxVal = -1.0;
+        let minVal = 1.0;
+        const scanSpan = Math.min(Math.round(trueLag), frameLength);
+        for (let i = 0; i < scanSpan; i++) {
+          const v = pcmData[offset + i];
+          if (v > maxVal) maxVal = v;
+          if (v < minVal) minVal = v;
+        }
+        peakAmplitudes.push(Math.max(1e-4, maxVal - minVal));
+
+        const rMax = Math.min(0.999, Math.max(0.01, maxNacf));
         const frameHnr = 10 * Math.log10(rMax / (1 - rMax));
         hnrSum += frameHnr;
         hnrCount++;
@@ -350,48 +418,68 @@ export function extractPitchAndPerturbation(
     }
   }
 
-  const voicedRatio = f0Track.length / Math.max(1, numFrames);
+  const voicedRatio = speechFrames > 0 ? f0Track.length / speechFrames : 0;
 
-  if (f0Track.length < 3) {
+  if (f0Track.length < 4) {
     return {
       f0Values: f0Track,
       meanF0: 150,
-      jitterPercent: 0.85,
-      shimmerPercent: 2.8,
-      hnrDb: 18.0,
+      jitterPercent: 0.15,
+      shimmerPercent: 0.95,
+      hnrDb: 12.0,
       voicedRatio,
+      snrDb,
+      clippingRatio,
     };
   }
 
-  // Mean F0
   const meanF0 = f0Track.reduce((a, b) => a + b, 0) / f0Track.length;
 
-  // Jitter (Period Perturbation Quotient - cycle-to-cycle F0 period delta)
-  const periods = f0Track.map((f0) => (1.0 / f0) * 1000); // milliseconds
-  let periodDeltaSum = 0;
-  for (let i = 1; i < periods.length; i++) {
-    periodDeltaSum += Math.abs(periods[i] - periods[i - 1]);
+  // PPQ-5 Jitter
+  let ppqDiffSum = 0;
+  const N = periods.length;
+  if (N >= 5) {
+    for (let i = 2; i < N - 2; i++) {
+      const localAvg = (periods[i - 2] + periods[i - 1] + periods[i] + periods[i + 1] + periods[i + 2]) / 5;
+      ppqDiffSum += Math.abs(periods[i] - localAvg);
+    }
+    const meanPeriod = periods.reduce((a, b) => a + b, 0) / N;
+    var jitterPercent = meanPeriod > 0 ? ((ppqDiffSum / (N - 4)) / meanPeriod) * 100 : 0.8;
+  } else {
+    let diffSum = 0;
+    for (let i = 1; i < N; i++) diffSum += Math.abs(periods[i] - periods[i - 1]);
+    const meanPeriod = periods.reduce((a, b) => a + b, 0) / N;
+    var jitterPercent = meanPeriod > 0 ? ((diffSum / (N - 1)) / meanPeriod) * 100 : 0.8;
   }
-  const meanPeriod = periods.reduce((a, b) => a + b, 0) / periods.length;
-  const jitterPercent = (periodDeltaSum / (periods.length - 1) / meanPeriod) * 100;
 
-  // Shimmer (Amplitude Perturbation Quotient - cycle-to-cycle peak amplitude delta)
-  let ampDeltaSum = 0;
-  for (let i = 1; i < peakAmplitudes.length; i++) {
-    ampDeltaSum += Math.abs(peakAmplitudes[i] - peakAmplitudes[i - 1]);
+  // APQ-5 Shimmer
+  let apqDiffSum = 0;
+  const M = peakAmplitudes.length;
+  if (M >= 5) {
+    for (let i = 2; i < M - 2; i++) {
+      const localAvg = (peakAmplitudes[i - 2] + peakAmplitudes[i - 1] + peakAmplitudes[i] + peakAmplitudes[i + 1] + peakAmplitudes[i + 2]) / 5;
+      apqDiffSum += Math.abs(peakAmplitudes[i] - localAvg);
+    }
+    const meanAmp = peakAmplitudes.reduce((a, b) => a + b, 0) / M;
+    var shimmerPercent = meanAmp > 0 ? ((apqDiffSum / (M - 4)) / meanAmp) * 100 : 2.5;
+  } else {
+    let diffSum = 0;
+    for (let i = 1; i < M; i++) diffSum += Math.abs(peakAmplitudes[i] - peakAmplitudes[i - 1]);
+    const meanAmp = peakAmplitudes.reduce((a, b) => a + b, 0) / M;
+    var shimmerPercent = meanAmp > 0 ? ((diffSum / (M - 1)) / meanAmp) * 100 : 2.5;
   }
-  const meanAmp = peakAmplitudes.reduce((a, b) => a + b, 0) / peakAmplitudes.length;
-  const shimmerPercent = meanAmp > 1e-4 ? (ampDeltaSum / (peakAmplitudes.length - 1) / meanAmp) * 100 : 2.5;
 
   const hnrDb = hnrCount > 0 ? hnrSum / hnrCount : 18.0;
 
   return {
     f0Values: f0Track,
     meanF0: Number(meanF0.toFixed(1)),
-    jitterPercent: Number(Math.max(0.01, Math.min(15.0, jitterPercent)).toFixed(3)),
-    shimmerPercent: Number(Math.max(0.05, Math.min(25.0, shimmerPercent)).toFixed(3)),
+    jitterPercent: Number(Math.max(0.01, Math.min(10.0, jitterPercent)).toFixed(2)),
+    shimmerPercent: Number(Math.max(0.1, Math.min(25.0, shimmerPercent)).toFixed(2)),
     hnrDb: Number(Math.max(2.0, Math.min(40.0, hnrDb)).toFixed(1)),
     voicedRatio: Number(voicedRatio.toFixed(2)),
+    snrDb,
+    clippingRatio,
   };
 }
 
@@ -447,7 +535,7 @@ export function computeAcousticMetrics(
       if (Math.abs(sample) > peak) peak = Math.abs(sample);
     }
     const frameRms = Math.sqrt(fSum / frameLen);
-    if (frameRms < 0.01) silenceFrames++;
+    if (frameRms < 0.008) silenceFrames++;
   }
 
   const rms = Math.sqrt(sumSq / n);
@@ -503,11 +591,11 @@ export function computeAcousticMetrics(
   const spectralFlatness = Number((totalFlatness / numSlices).toFixed(3));
   const spectralRolloff = Math.round(totalRolloff / numSlices);
 
-  // 4. Vocoder High-Frequency Cutoff Detection (> 14kHz energy drop)
+  // 4. Vocoder Cutoff Detection
   let highFreqDropDetected = false;
   let vocoderCutoffHz: number | undefined = undefined;
 
-  const cutoffThresholdBin = Math.floor(numBins * 0.75);
+  const cutoffThresholdBin = Math.floor(numBins * 0.70);
   let topBandEnergy = 0;
   let midBandEnergy = 0;
 
@@ -523,12 +611,11 @@ export function computeAcousticMetrics(
   }
 
   const topToMidRatio = topBandEnergy / Math.max(1e-3, midBandEnergy);
-  if (topToMidRatio < 0.08 && sampleRate >= 32000) {
+  if (topToMidRatio < 0.06 && sampleRate >= 32000) {
     highFreqDropDetected = true;
     vocoderCutoffHz = Math.round(frequencies[cutoffThresholdBin]);
   }
 
-  // 5. Authentic Pitch & Perturbation Tracking
   const pitch = extractPitchAndPerturbation(pcmData, sampleRate);
 
   return {
@@ -540,7 +627,7 @@ export function computeAcousticMetrics(
     pitchJitterPercent: pitch.jitterPercent,
     vocalShimmerPercent: pitch.shimmerPercent,
     vocoderCutoffHz: highFreqDropDetected ? vocoderCutoffHz : undefined,
-    snrDb: Math.min(45, Math.max(12, Math.round(30 + Math.log10(rms + 1e-4) * 8))),
+    snrDb: pitch.snrDb,
     harmonicToNoiseRatioDb: pitch.hnrDb,
     silenceRatioPercent,
   };
@@ -591,68 +678,69 @@ export function classifyClientFeatures(
     };
   }
 
+  // Quality checks
+  const isShort = durationSec < 0.75;
+  const isNoisy = (measurements.snrDb || 25) < 9.0;
+
   // 1. Vocoder Cutoff Score (Weight: 0.25)
   let vocoderSyntheticProb = 0.05;
   if (measurements.vocoderCutoffHz !== undefined) {
     vocoderSyntheticProb = 0.95;
   }
 
-  // 2. Jitter / Shimmer Perturbation Score (Weight: 0.20)
-  // Human: Jitter 0.5% - 1.8%, Shimmer 1.8% - 5.5%
+  // 2. Jitter / Shimmer Perturbation Score (Weight: 0.22)
   let perturbationSyntheticProb = 0.1;
   const j = measurements.pitchJitterPercent;
   const s = measurements.vocalShimmerPercent;
   if (j < 0.25 || s < 1.0) {
-    // Unnaturally flat / machine quantized
-    perturbationSyntheticProb = 0.88;
-  } else if (j > 4.5 || s > 12.0) {
-    // Extreme synthesis phase jitter
+    perturbationSyntheticProb = 0.92;
+  } else if (j > 4.2 || s > 10.0) {
     perturbationSyntheticProb = 0.82;
-  } else if (j >= 0.5 && j <= 1.8 && s >= 1.8 && s <= 5.5) {
-    perturbationSyntheticProb = 0.08;
+  } else if (j >= 0.4 && j <= 1.8 && s >= 1.8 && s <= 5.5) {
+    perturbationSyntheticProb = 0.05;
   } else {
-    perturbationSyntheticProb = 0.45;
+    perturbationSyntheticProb = 0.40;
   }
 
-  // 3. Spectral Flatness (Wiener Entropy) (Weight: 0.20)
-  let flatnessSyntheticProb = 0.15;
-  if (measurements.spectralFlatness > 0.38) {
-    flatnessSyntheticProb = 0.85;
-  } else if (measurements.spectralFlatness < 0.05) {
-    flatnessSyntheticProb = 0.1;
+  // 3. Spectral Flatness (Wiener Entropy) (Weight: 0.18)
+  let flatnessSyntheticProb = 0.12;
+  if (measurements.spectralFlatness > 0.36) {
+    flatnessSyntheticProb = 0.88;
+  } else if (measurements.spectralFlatness < 0.08) {
+    flatnessSyntheticProb = 0.06;
   } else {
-    flatnessSyntheticProb = 0.2 + measurements.spectralFlatness * 1.5;
+    flatnessSyntheticProb = 0.15 + measurements.spectralFlatness * 1.5;
   }
 
   // 4. Harmonic-to-Noise Ratio (Weight: 0.15)
-  let hnrSyntheticProb = 0.2;
+  let hnrSyntheticProb = 0.15;
   if (measurements.harmonicToNoiseRatioDb < 10) {
-    hnrSyntheticProb = 0.65;
-  } else if (measurements.harmonicToNoiseRatioDb > 22) {
-    hnrSyntheticProb = 0.12;
+    hnrSyntheticProb = 0.72;
+  } else if (measurements.harmonicToNoiseRatioDb > 18) {
+    hnrSyntheticProb = 0.06;
   }
 
   // 5. Dynamic Range & Respiration (Weight: 0.10)
-  let temporalSyntheticProb = 0.2;
-  if (durationSec > 4 && measurements.silenceRatioPercent < 2) {
-    temporalSyntheticProb = 0.75;
-  } else if (measurements.dynamicRangeDb < 20) {
-    temporalSyntheticProb = 0.6;
+  let temporalSyntheticProb = 0.15;
+  if (durationSec > 3.5 && measurements.silenceRatioPercent < 2) {
+    temporalSyntheticProb = 0.80;
+  } else if (measurements.dynamicRangeDb < 18) {
+    temporalSyntheticProb = 0.65;
   } else {
-    temporalSyntheticProb = 0.1;
+    temporalSyntheticProb = 0.08;
   }
 
   // 6. Zero Crossing Rate (Weight: 0.10)
-  let zcrSyntheticProb = 0.15;
+  let zcrSyntheticProb = 0.12;
   if (measurements.zeroCrossingRate > 0.18 || measurements.zeroCrossingRate < 0.015) {
-    zcrSyntheticProb = 0.6;
+    zcrSyntheticProb = 0.55;
   }
 
   // Weighted Bayesian Fusion
   const syntheticProbability =
     vocoderSyntheticProb * 0.25 +
-    perturbationSyntheticProb * 0.20 +
-    flatnessSyntheticProb * 0.20 +
+    perturbationSyntheticProb * 0.22 +
+    flatnessSyntheticProb * 0.18 +
     hnrSyntheticProb * 0.15 +
     temporalSyntheticProb * 0.10 +
     zcrSyntheticProb * 0.10;
@@ -662,9 +750,14 @@ export function classifyClientFeatures(
   let riskLevel: RiskLevel;
   let overallScore: number;
 
-  if (syntheticProbability >= 0.62) {
+  if (isShort || isNoisy) {
+    verdict = "suspicious";
+    confidence = 0.62;
+    riskLevel = "medium";
+    overallScore = 0.50;
+  } else if (syntheticProbability >= 0.56) {
     verdict = "cloned";
-    confidence = Number(Math.min(0.992, 0.85 + (syntheticProbability - 0.62) * 0.36).toFixed(3));
+    confidence = Number(Math.min(0.992, 0.86 + (syntheticProbability - 0.56) * 0.32).toFixed(3));
     riskLevel = "critical";
     overallScore = Number(Math.max(0.04, 1.0 - syntheticProbability).toFixed(3));
   } else if (syntheticProbability <= 0.34) {
@@ -674,7 +767,7 @@ export function classifyClientFeatures(
     overallScore = Number(Math.min(0.98, 1.0 - syntheticProbability).toFixed(3));
   } else {
     verdict = "suspicious";
-    confidence = Number(Math.max(0.55, 1.0 - Math.abs(syntheticProbability - 0.5) * 2.5).toFixed(3));
+    confidence = Number(Math.max(0.55, 1.0 - Math.abs(syntheticProbability - 0.45) * 2.2).toFixed(3));
     riskLevel = "medium";
     overallScore = Number((1.0 - syntheticProbability).toFixed(3));
   }
@@ -683,8 +776,8 @@ export function classifyClientFeatures(
   const isC = verdict === "cloned";
 
   const domainScores = {
-    spectralScore: Math.round(isH ? 92 - measurements.spectralFlatness * 30 : isC ? 22 + (1 - syntheticProbability) * 20 : 58),
-    prosodyScore: Math.round(isH ? 94 - Math.abs(j - 1.0) * 10 : isC ? 18 + (1 - syntheticProbability) * 20 : 62),
+    spectralScore: Math.round(isH ? 92 - measurements.spectralFlatness * 25 : isC ? 22 + (1 - syntheticProbability) * 20 : 58),
+    prosodyScore: Math.round(isH ? 94 - Math.abs(j - 1.0) * 8 : isC ? 18 + (1 - syntheticProbability) * 20 : 62),
     harmonicScore: Math.round(Math.min(98, Math.max(15, measurements.harmonicToNoiseRatioDb * 3.8))),
     temporalScore: Math.round(isH ? 96 - (measurements.silenceRatioPercent < 5 ? 15 : 0) : isC ? 32 : 68),
     phaseScore: Math.round(isH ? 95 : isC ? 18 : 60),
@@ -771,13 +864,15 @@ export function runFullForensicAnalysis(
   const startTime = performance.now();
   const { pcmData, sampleRate, duration, channels, sha256 } = decoded;
 
+  const preemphasizedPcm = applyPreEmphasis(pcmData, 0.97);
+
   // 1. Real Waveform
   const waveformData = extractWaveformData(pcmData, 200);
 
   // 2. Real STFT Spectrogram
-  const stft = computeRealSTFT(pcmData, sampleRate, 140, 64);
+  const stft = computeRealSTFT(preemphasizedPcm, sampleRate, 140, 64);
 
-  // 3. Real Acoustic Metrics (NACF F0, Wiener entropy, ZCR, Dynamic Range)
+  // 3. Real Acoustic Metrics
   const measurements = computeAcousticMetrics(pcmData, sampleRate, stft);
 
   // 4. Calibrated Ensemble Classifier
@@ -809,11 +904,11 @@ export function runFullForensicAnalysis(
       expectedNormal: "1200 - 2800 Hz",
     },
     {
-      name: "Micro-Prosodic Pitch Perturbations",
+      name: "Micro-Prosodic Pitch Perturbations (Jitter)",
       score: Number((domainScores.prosodyScore / 100).toFixed(2)),
       anomaly: isCloned || measurements.pitchJitterPercent < 0.25 || measurements.pitchJitterPercent > 4.0,
       category: "prosody",
-      description: "Evaluates organic pitch jitter and fundamental frequency micro-vibrations (PPQ).",
+      description: "Evaluates organic pitch jitter and fundamental frequency micro-vibrations (PPQ-5).",
       measuredValue: `${measurements.pitchJitterPercent}% jitter PPQ`,
       expectedNormal: "0.5% - 1.8% PPQ",
     },

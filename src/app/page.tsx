@@ -85,6 +85,12 @@ export default function Home() {
     handleBenchmarkSelect(cloneBench);
   };
 
+  const handleRecordAgain = () => {
+    playSound.click();
+    setStage("idle");
+    document.getElementById("upload")?.scrollIntoView({ behavior: "smooth" });
+  };
+
   const handleHistorySelect = (item: AnalysisResult) => {
     playSound.click();
     setResult(item);
@@ -119,7 +125,7 @@ export default function Home() {
 
         {result && (
           <div id="results" className="space-y-12">
-            <DetectionResults result={result} />
+            <DetectionResults result={result} onRecordAgain={handleRecordAgain} />
           </div>
         )}
 

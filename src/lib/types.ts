@@ -109,6 +109,9 @@ export interface AnalysisResult {
     samplesAnalyzed: number;
     sha256Validation: string;
     detectorArchitecture: string;
+    stftFramesCount?: number;
+    ensembleModelsCount?: number;
+    calibrationStandard?: string;
   };
 }
 
